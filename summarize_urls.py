@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 """
 Recursively reads every .md file in an inbox directory,
-extracts all URLs, and summarizes each one using Ollama (gemma4:e4b).
+extracts all URLs, scrapes their HTML content,
+and summarizes each one using Ollama (gemma4:e4b).
 """
 
+import argparse
+import http.client
+import json
 import os
 import re
-import subprocess
 import sys
 import time
+import urllib.request
 from urllib.parse import urlparse
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from dotenv import load_dotenv
 
-
-# ── Configuration ────────────────────────────────────────────────
-INPUT_DIR  = "/home/djorgs/Documents/Obsidian/David Second Brain/inbox/"
-OUTPUT_DIR = "/home/djorgs/Documents/Obsidian/David Second Brain/bin/inbox-processed/"
-MODEL      = "gemma4:e4b"
-OLLAMA_CMD = ["ollama", "run", MODEL]  # streaming model; use "ollama serve" + API for non-terminal mode
+# import .env variables
+load_dotenv()
+OLLAMA_API_KEY = os.getenv('OLLAMA_API_KEY')
+SELENIUM_DOMAINS = {d.strip() for d in (os.getenv('SELENIUM_DOMAINS') or '').split(',') if d.strip()}
+INPUT_DIR  = os.getenv('INPUT_DIR')
+OUTPUT_DIR = os.getenv('OUTPUT_DIR')
+MODEL      = os.getenv('MODEL')
+OLLAMA_CMD = os.getenv('OLLAMA_CMD')
+NUMBER_TO_FETCH = os.getenv('NUMBER_TO_FETCH')
 
 # Regex that matches URLs
 URL_RE = re.compile(
@@ -45,107 +59,210 @@ def collect_urls_from_file(filepath: str) -> list[str]:
     return list(dict.fromkeys(cleaned))  # deduplicate while preserving order
 
 
-def collect_all_urls(input_dir: str) -> list[str]:
-    """Walk the directory tree and collect every unique URL from .md files."""
-    urls: list[str] = []
-    seen: set[str] = set()
-
+def collect_all_urls(input_dir: str, max_files: int = int(NUMBER_TO_FETCH or 0)) -> list[str]:
+    """Walk the directory tree and collect URLs from the most recently modified .md files."""
+    md_files = []
     for root, _dirs, files in os.walk(input_dir):
         for fname in files:
             if not fname.lower().endswith(".md"):
                 continue
             filepath = os.path.join(root, fname)
-            for url in collect_urls_from_file(filepath):
-                if url not in seen:
-                    seen.add(url)
-                    urls.append(url)
+            md_files.append((os.path.getmtime(filepath), filepath))
+
+    md_files.sort(reverse=True)
+    recent_files = [fp for _, fp in (md_files if not max_files else md_files[:max_files])]
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for filepath in recent_files:
+        for url in collect_urls_from_file(filepath):
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
     return urls
 
 
-def summarize_url(url: str) -> str | None:
-    """Use ollama (non-streaming via API) to summarize a URL."""
-    prompt = (
-        f"Summarize the content of this URL in a concise paragraph. "
-        f"Return only the summary, no intro, no extra text.\n\n"
-        f"URL: {url.encode('utf-8')}"
+def clean_html(html_content: str) -> str:
+    """Extract readable text from HTML, removing scripts/styles."""
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+        # Remove script and style elements
+        for script in soup(["script", "style", "header", "footer", "nav", "aside"]):
+            script.decompose()
+        # Get text
+        text = soup.get_text(separator='\n')
+        # Break into lines and remove leading and trailing white space
+        lines = (line.strip() for line in text.splitlines())
+        # Break multi-headlines into a line each
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        # Drop blank lines
+        text = '\n'.join(chunk for chunk in chunks if chunk)
+        return text
+    except Exception:
+        return html_content[:2000]  # Fallback if parsing fails
+
+
+def extract_title(html_content: str) -> str:
+    """Extract the <title> tag text from HTML."""
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+        tag = soup.find("title")
+        return tag.get_text().strip() if tag else ""
+    except Exception:
+        return ""
+
+
+def ollama_generate(prompt: str) -> str | None:
+    """Send a prompt to the local Ollama API and return the response text."""
+    try:
+        payload = {"model": MODEL, "prompt": prompt, "stream": False}
+        conn = http.client.HTTPConnection("localhost", 11434, timeout=120)
+        conn.request("POST", "/api/generate", body=json.dumps(payload),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        if resp.status == 200:
+            return json.loads(resp.read().decode("utf-8")).get("response", "").strip()
+        print(f"  ✗  Ollama API error (status {resp.status})")
+        return None
+    except Exception as e:
+        print(f"  ✗  Ollama API error: {e}")
+        return None
+
+
+def fetch_with_selenium(url: str) -> str:
+    """Fetch page HTML using a real Chrome browser via Selenium."""
+    
+
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1280,900")
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     )
 
-    # Use ollama API (non-streaming) instead of "ollama run" to avoid terminal/tty issues
-    api_payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "stream": False,
-    }
+    driver = webdriver.Chrome(options=opts)
     try:
-        import http.client
-        conn = http.client.HTTPConnection("localhost", 11434, timeout=120)
-        conn.request("POST", "/api/generate", body=api_payload.__str__().replace("model", '"model"').replace("prompt", '"prompt"').replace("stream", '"stream"'), headers={"Content-Type": "application/json"})
-        # Simpler approach: dump JSON manually
-        import json
-        conn2 = http.client.HTTPConnection("localhost", 11434, timeout=120)
-        conn2.request(
-            "POST",
-            "/api/generate",
-            body=json.dumps(api_payload),
-            headers={"Content-Type": "application/json"},
+        driver.get(url)
+        # Wait for body to be present and allow JS to render
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
-        resp = conn2.getresponse()
-        if resp.status == 200:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "").strip()
-        else:
-            print(f"  ✗  API error ({resp.status}) for {url}")
+        time.sleep(2)  # let dynamic content settle
+        return driver.page_source
+    finally:
+        driver.quit()
+
+
+def needs_selenium(url: str) -> bool:
+    return urlparse(url).netloc in SELENIUM_DOMAINS
+
+
+def summarize_url(url: str) -> dict | None:
+    """Fetch HTML from URL, then return title, summary, and tags via Ollama."""
+    # 1. Fetch HTML
+    html_content = None
+    if needs_selenium(url):
+        print(f"  🌐  Using Selenium for {urlparse(url).netloc}")
+        try:
+            html_content = fetch_with_selenium(url)
+        except Exception as e:
+            print(f"  ⚠  Could not fetch {url}: {e}")
             return None
-    except Exception as e:
-        print(f"  ✗  Ollama API error for {url}: {e}")
+    else:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                html_content = response.read().decode('utf-8', errors='ignore')
+        except Exception as e:
+            print(f"  ⚠  urllib failed ({e}), retrying with Selenium...")
+            try:
+                html_content = fetch_with_selenium(url)
+            except Exception as e2:
+                print(f"  ⚠  Selenium also failed for {url}: {e2}")
+                return None
+
+    # 2. Extract title and clean body text
+    title = extract_title(html_content)
+    text_content = clean_html(html_content)
+    if len(text_content) > 12000:
+        text_content = text_content[:12000] + "\n... [truncated] ..."
+
+    # 3. Generate summary
+    summary = ollama_generate(
+        f"Summarize the following content in a concise paragraph. "
+        f"Return only the summary, no intro, no extra text.\n\n"
+        f"---\n{text_content}\n---"
+    )
+    if not summary:
         return None
+
+    # 4. Generate tags
+    tags_raw = ollama_generate(
+        f"Generate 3-7 concise lowercase tags for the following content. "
+        f"Return only a comma-separated list of tags, no intro, no extra text.\n\n"
+        f"---\n{text_content}\n---"
+    )
+    tags = [
+        re.sub(r"[^\w-]", "-", tag.strip().lower())
+        for tag in tags_raw.split(",")
+        if tag.strip()
+    ]
+
+    return {"title": title, "summary": summary, "tags": tags}
 
 
 def safe_filename(url: str) -> str:
     """Turn a URL into a safe filesystem-friendly filename."""
     parsed = urlparse(url)
     slug = parsed.netloc + parsed.path
-    slug = re.sub(r"[^\w\s-]", "", slug).strip().lower()
+    slug = re.sub(r"[^\w\s-]", "_", slug).strip().lower()
     slug = re.sub(r"[-\s]+", "-", slug)
     slug = slug[:180]  # prevent filename too long
     return slug or "untitled"
 
 
-def write_summary(output_dir: str, url: str, summary: str, source_file: str | None = None) -> str:
-    """Write the summary to a markdown file in the output directory."""
+def write_summary(output_dir: str, url: str, title: str, summary: str, tags: list[str]) -> str:
+    """Write the summary to a markdown file with YAML frontmatter."""
     os.makedirs(output_dir, exist_ok=True)
     fname = safe_filename(url) + ".md"
     outpath = os.path.join(output_dir, fname)
 
-    body = ""
-    if source_file:
-        rel_source = os.path.relpath(source_file, input_dir_global)
-        body += f"> Summarized from: [{rel_source}]({rel_source})\n\n"
-
-    body += f"- **URL**: {url}\n"
-    body += f"- **Date**: {time.strftime('%Y-%m-%d %H:%M')}\n"
-    body += f"- **Model**: {MODEL}\n\n"
-    body += "---\n\n"
-    body += summary + "\n"
+    safe_title = title.replace('"', '\\"') if title else safe_filename(url)
+    tags_yaml = "\n".join(f"  - {t}" for t in tags) if tags else "  []"
+    frontmatter = (
+        f"---\n"
+        f'title: "{safe_title}"\n'
+        f"source: {url}\n"
+        f"created: {time.strftime('%Y-%m-%d')}\n"
+        f"tags:\n{tags_yaml}\n"
+        f"---\n\n"
+    )
 
     with open(outpath, "w", encoding="utf-8") as f:
-        f.write(body)
+        f.write(frontmatter + summary + "\n")
     return outpath
-
-
-# ── Globals ──────────────────────────────────────────────────────
-input_dir_global = INPUT_DIR  # needed by write_summary closure
 
 
 # ── Main ─────────────────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--all", action="store_true", help="Process all inbox files, ignoring NUMBER_TO_FETCH")
+    args = parser.parse_args()
+
+    max_files = 0 if args.all else int(NUMBER_TO_FETCH or 0)
+
     print("=" * 60)
     print("  Obsidian Link Summarizer")
     print("=" * 60)
 
     # 1. Collect URLs
-    print(f"\n📂 Scanning {INPUT_DIR} for .md files...")
-    urls = collect_all_urls(INPUT_DIR)
+    scope = "all" if not max_files else f"{max_files} most recent"
+    print(f"\n📂 Scanning {INPUT_DIR} for .md files ({scope})...")
+    urls = collect_all_urls(INPUT_DIR, max_files=max_files)
 
     if not urls:
         print("No URLs found. Nothing to do.")
@@ -184,17 +301,6 @@ def main():
     processed = 0
     skipped = 0
 
-    # Build lookup: url -> source file (first one found)
-    url_to_source: dict[str, str] = {}
-    for root, _dirs, files in os.walk(INPUT_DIR):
-        for fname in files:
-            if not fname.lower().endswith(".md"):
-                continue
-            fp = os.path.join(root, fname)
-            for url in collect_urls_from_file(fp):
-                if url not in url_to_source:
-                    url_to_source[url] = fp
-
     for idx, url in enumerate(urls, start=1):
         print(f"\n[{idx}/{total}] ({idx}/{total}) Processing: {url[:100]}{'...' if len(url) > 100 else ''}")
 
@@ -205,9 +311,9 @@ def main():
             skipped += 1
             continue
 
-        summary = summarize_url(url)
-        if summary:
-            outpath = write_summary(output_dir, url, summary, source_file=url_to_source.get(url))
+        result = summarize_url(url)
+        if result:
+            outpath = write_summary(output_dir, url, result["title"], result["summary"], result["tags"])
             print(f"  ✅  Saved to: {outpath}")
         else:
             print(f"  ✗  Failed to summarize")
