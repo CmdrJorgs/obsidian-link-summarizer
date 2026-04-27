@@ -81,6 +81,19 @@ def collect_all_urls(input_dir: str, max_files: int = int(NUMBER_TO_FETCH or 0))
                 urls.append(url)
     return urls
 
+def collect_file_urls(filepath: str) -> list[str]:
+    """Collect URLs from the specified .md file in the --file argument."""
+    md_files = []
+    md_files.append((os.path.getmtime(filepath), filepath))
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for url in collect_urls_from_file(filepath):
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
 
 def clean_html(html_content: str) -> str:
     """Extract readable text from HTML, removing scripts/styles."""
@@ -251,18 +264,27 @@ def write_summary(output_dir: str, url: str, title: str, summary: str, tags: lis
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--all", action="store_true", help="Process all inbox files, ignoring NUMBER_TO_FETCH")
+    parser.add_argument("--file", type=str, required=False, help="Path to the input file if you only want to process a single file, ignoring NUMBER_TO_FETCH")
     args = parser.parse_args()
 
     max_files = 0 if args.all else int(NUMBER_TO_FETCH or 0)
+    file_bool = True if args.file else False
 
     print("=" * 60)
     print("  Obsidian Link Summarizer")
     print("=" * 60)
 
     # 1. Collect URLs
-    scope = "all" if not max_files else f"{max_files} most recent"
-    print(f"\n📂 Scanning {INPUT_DIR} for .md files ({scope})...")
-    urls = collect_all_urls(INPUT_DIR, max_files=max_files)
+    if file_bool:
+        scope = args.file
+        print(f"\n📄 Scanning {scope}...")
+        urls = collect_file_urls(args.file)
+    else:
+        scope = "all" if not max_files else f"{max_files} most recent"
+        print(f"\n📂 Scanning {INPUT_DIR} for .md files ({scope})...")
+        urls = collect_all_urls(INPUT_DIR, max_files=max_files)
+    
+    
 
     if not urls:
         print("No URLs found. Nothing to do.")
